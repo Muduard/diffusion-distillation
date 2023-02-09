@@ -1,1 +1,0 @@
-Put celeba folder with checkpoints here.
