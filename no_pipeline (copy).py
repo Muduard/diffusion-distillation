@@ -18,9 +18,9 @@ from scheduling import CustomScheduler, ScheduleTypes
 @dataclass
 class TrainingConfig:
     image_size = 32  # the generated image resolution
-    train_batch_size = 24
+    train_batch_size = 32
     eval_batch_size = 16  # how many images to sample during evaluation
-    num_epochs = 15
+    num_epochs = 100
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
     lr_warmup_steps = 500
@@ -96,12 +96,13 @@ def batch_last(a):
 dataset.set_transform(transform)
 train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
 
-pretrained_student = ""#config.output_dir + "/0epoch5/" #""##  #
+pretrained_student = config.output_dir + "/0epoch3/" #""  #
+
 
 model_id = "google/ddpm-cifar10-32"
 
 # load model and scheduler
-teacher = UNet2DModel.from_pretrained("c10/0epoch9")#DDPMPipeline.from_pretrained(model_id).unet # ##
+teacher = DDPMPipeline.from_pretrained(model_id).unet#UNet2DModel.from_pretrained("c10/0epoch1-")  ##
 teacher = teacher.to("cuda:0")
 
 if pretrained_student == "":
@@ -140,20 +141,21 @@ def train_loop(config, student, optimizer, train_dataloader, lr_scheduler, teach
 
     global_step = 0
     K = 3
-    starting_K = 1
-    N = 256
+    starting_K = 0
+    N = 512
     noise_scheduler = CustomScheduler(device, schedule)
-    starting_epoch = 0
+    starting_epoch = 4
     ts = torch.from_numpy(np.arange(0, N)[::-1].copy()).to(device)
-    one = torch.tensor([1], device=device, dtype=torch.int64)
+    one = torch.tensor([N], device=device, dtype=torch.int64)
     # Add 2 elements at the beggining to evaluate t-1 and t-2
-    ts = torch.cat((one, one, ts), 0)
+    #ts = torch.cat((one, one, ts), 0)
+    ts = torch.cat((ts, one, one), 0)
     # Timesteps for mid-steps e.g. t - 0.5/N
     #ts2 = torch.from_numpy(np.arange(0, 2 * N)[::-1].copy()).to(device)
     #ts2 = torch.cat((one, one, ts2), 0)
     #ts2N = ts2/N
     tsN = ts/N
-    betas = noise_scheduler.get_betas(N+2, ts)
+    betas = noise_scheduler.get_betas(N+1, ts)
     alphas = 1 - betas
 
     for j in range(starting_K, K):
@@ -170,12 +172,14 @@ def train_loop(config, student, optimizer, train_dataloader, lr_scheduler, teach
                 x = batch['img']  # Batch size last for timestep multiplication
 
                 # Sample a random timestep for each image
-                i = torch.randint(1, int(N), (x.shape[0],), device=x.device).long()
+                i = torch.randint(0, int(N), (x.shape[0],), device=x.device).long()
 
-                i = torch.add(i, other=2)
+                i = torch.add(i, other=1)
 
-                alpha_t = alphas[ts[i]]
+                alpha_t = alphas[ts[i+1]]
                 sigma_t = compute_sigma(alpha_t).to(x.device)
+                alphas_s = alphas[ts[(i//2).to(torch.long)]]
+                sigma_s = compute_sigma(alphas_s).to(x.device)
 
                 # Sample noise to add to the images
                 epsilon = torch.randn(x.shape).to(x.device)
@@ -190,42 +194,40 @@ def train_loop(config, student, optimizer, train_dataloader, lr_scheduler, teach
                 z_t = batch_first(zT_t)
 
                 # 2 Steps of DDIM of teacher
-                alpha_t1 = alphas[ts[i-1]]  # t - 0.5/N
-                alpha_t2 = alphas[ts[i-2]]  # t - 1/N
+                alpha_t1 = alphas[ts[i]]  # t - 0.5/N
+                #alpha_t2 = alphas[ts[i]]  # t - 1/N
                 sigma_t1 = compute_sigma(alpha_t1).to(x.device)
-                sigma_t2 = compute_sigma(alpha_t2).to(x.device)
+                #sigma_t2 = compute_sigma(alpha_t2).to(x.device)
 
-                eps_t = teacher(z_t, tsN[i], return_dict=False)[0]
+                eps_t = teacher(z_t, tsN[i+1], return_dict=False)[0]
                 epsT_t = batch_last(eps_t)
-
+                v_t = alpha_t * epsT_t - sigma_t * xT
                 xT_t = (zT_t - sigma_t * epsT_t) / alpha_t
 
                 zT_t1 = alpha_t1 * xT_t + (sigma_t1 / sigma_t) * (zT_t - alpha_t * xT_t)
                 z_t1 = batch_first(zT_t1)
 
-                eps_t1 = teacher(z_t1, tsN[i-1], return_dict=False)[0]
+                eps_t1 = teacher(z_t1, tsN[i], return_dict=False)[0]
                 epsT_t1 = batch_last(eps_t1)
+                v_t1 = alpha_t * epsT_t - sigma_t * xT
+                #xT_t1 = (zT_t1 - sigma_t1 * epsT_t1) / alpha_t1
+                x_t2 = (alpha_t1 * zT_t1 - sigma_t1 * v_t1).clip(-1, 1)
+                eps_2 = (zT_t - alphas_s * x_t2) / sigma_s
+                v_t2 = alphas_s * eps_2 - sigma_s * x_t2
+                #zT_t2 = alpha_t2 * xT_t1 + (sigma_t2 / sigma_t1) * (zT_t1 - alpha_t1 * xT_t1)
 
-                xT_t1 = (zT_t1 - sigma_t1 * epsT_t1) / alpha_t1
-
-                zT_t2 = alpha_t2 * xT_t1 + (sigma_t2 / sigma_t1) * (zT_t1 - alpha_t1 * xT_t1)
-
-                x_tilde = (zT_t2 - (sigma_t2 / sigma_t) * zT_t) / (alpha_t2 - (sigma_t2 / sigma_t) * alpha_t)
+                #x_tilde = (zT_t2 - (sigma_t2 / sigma_t) * zT_t) / (alpha_t2 - (sigma_t2 / sigma_t) * alpha_t)
 
                 omega_t = torch.max(torch.tensor([torch.mean(alpha_t ** 2 / sigma_t ** 2), 1]))
 
                 with accelerator.accumulate(student):
                     # Predict the noise residual
                     #student(z_t, tsN[i], return_dict=False)[0]
-                    eps_student = student(z_t, tsN[i], return_dict=False)[0]
+                    eps_student = student(z_t, tsN[(i//2).to(torch.long)], return_dict=False)[0]
                     epsT_student = batch_last(eps_student)
-                    x_student = (zT_t - sigma_t * epsT_student) / alpha_t
-
-                    z_student = (alpha_t * x_student + sigma_t * epsilonT)
-
-                    x_tilde_student = (zT_t2 - (sigma_t2 / sigma_t) * z_student) / (alpha_t2 - (sigma_t2 / sigma_t) * alpha_t)
-
-                    loss = omega_t * F.mse_loss(x_tilde, x_tilde_student)
+                    v_student = alphas_s * epsT_student - sigma_s * xT
+                    #x_student = (zT_t - sigma_t * epsT_student) / alpha_t
+                    loss = F.mse_loss(v_student, v_t2)
                     accelerator.backward(loss)
 
                     accelerator.clip_grad_norm_(student.parameters(), 1.0)
@@ -257,8 +259,9 @@ args = (config, student, optimizer, train_dataloader, lr_scheduler, teacher, Sch
 
 train_loop(*args)
 
-#teacher = UNet2DModel.from_pretrained("./c10/0epoch6/", device_map="auto")
-#evaluate(config, 10, teacher, gen, 256, ScheduleTypes.COSINE)
+
+#teacher = UNet2DModel.from_pretrained("./c10/0epoch1/", device_map="auto")
+#evaluate(config, 10, teacher, gen, 512, ScheduleTypes.COSINE)
 
 
 

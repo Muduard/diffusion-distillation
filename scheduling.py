@@ -71,6 +71,45 @@ class CustomScheduler:
         pred_prev_sample = pred_prev_sample + variance
         return pred_prev_sample
 
+    def denoise_ddim_step(self, model_output, t, sample, generator, alphas, alphas_cumprod, betas, schedule):
+        eta = 1.0
+        alpha_prod_t = alphas_cumprod[t]
+        alpha_t1 = alphas_cumprod[t - 1] if t > 0 else torch.tensor([1], device=self.device)
+        alpha_prod_t_prev = alpha_t1
+
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+        pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+        pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        std_dev_t = eta * variance ** (0.5)
+        model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+        # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t ** 2) ** (0.5) * model_output
+
+        # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+        if eta > 0:
+            # randn_like does not support generator https://github.com/pytorch/pytorch/issues/27072
+            device = model_output.device
+            variance_noise = torch.randn(
+                    model_output.shape, generator=generator, device=device, dtype=model_output.dtype)
+            variance = std_dev_t * variance_noise
+
+        prev_sample = prev_sample + variance
+        return prev_sample
+
+    def denoise_x_tilde(self, model_output, t, sample, generator, alphas, alphas_cumprod, betas, schedule):
+        alphas = alphas_cumprod
+        sigmas = torch.sqrt(1 - alphas ** 2)
+        diff_alpha = alphas[t] - alphas[t+2]
+        diff_sigma = sigmas[t] - sigmas[t+2]
+
+        first_coeff = - (model_output * alphas[t+2] * sigmas[t]) / (sigmas[t+2] * diff_alpha)
+        second_coeff = (alphas[t] * model_output) / diff_alpha
+        third_coeff = -(diff_sigma * sample) / diff_alpha
+        return first_coeff + second_coeff + third_coeff
 
     #code from https://github.com/huggingface/diffusers/blob/v0.7.0/src/diffusers/pipelines/ddpm/pipeline_ddpm.py __call__()
     @torch.no_grad()
@@ -100,7 +139,7 @@ class CustomScheduler:
             # 1. predict noise model_output
             model_output = model(image, t).sample
             # 2. compute previous image: x_t -> x_t-1
-            image = self.denoise_step(
+            image = self.denoise_ddim_step(
                 model_output, t, image, generator, alphas, alphas_cumprod, betas, ScheduleTypes.COSINE
             )
 
