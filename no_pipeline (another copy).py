@@ -14,10 +14,115 @@ import numpy as np
 import copy
 from tqdm.auto import tqdm
 import os
-from old_scheduling import TrigScheduler, ScheduleTypes
+from scheduling import CustomScheduler, ScheduleTypes, PredTypes
+@dataclass
+class TrainingConfig:
+    image_size = 32  # the generated image resolution
+    train_batch_size = 24
+    eval_batch_size = 16  # how many images to sample during evaluation
+    num_epochs = 15
+    gradient_accumulation_steps = 1
+    learning_rate = 1e-4
+    lr_warmup_steps = 500
+    save_image_epochs = 1
+    save_model_epochs = 1
+    mixed_precision = 'fp16'  # `no` for float32, `fp16` for automatic mixed precision
+    output_dir = 'c10'  # the model namy locally and on the HF Hub
+
+    push_to_hub = False  # whether to upload the saved model to the HF Hub
+    hub_private_repo = False
+    overwrite_output_dir = True  # overwrite the old model when re-running the notebook
+    seed = 0
 
 
-def train_loop_eps(config, student, optimizer, train_dataloader, lr_scheduler, teacher, schedule, timestep_type):
+config = TrainingConfig()
+config.dataset_name = "cifar10"
+dataset = load_dataset(config.dataset_name, split="train")
+preprocess = transforms.Compose(
+    [
+        transforms.Resize((config.image_size, config.image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ]
+)
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def transform(examples):
+    images = [preprocess(image.convert("RGB")) for image in examples["img"]]
+    return {"img": images}
+
+
+def make_grid(images, rows, cols):
+    w, h, r = images[0].shape
+    grid = Image.new('RGB', size=(cols * w, rows * h))
+
+    for i, image in enumerate(images):
+        im = (image * 255).astype(np.uint8)
+        im = Image.fromarray(im)
+        grid.paste(im, box=(i % cols * w, i // cols * h))
+    return grid
+
+
+def evaluate(config, epoch, model, gen, timestep_number, schedule, pred_type):
+    # Sample some images from random noise (this is the backward diffusion process).
+    # The default pipeline output type is `List[PIL.Image]`
+    noise_scheduler = CustomScheduler(device, schedule)
+    images = noise_scheduler.denoise(model, (3, 32, 32), gen, timestep_number, config.eval_batch_size, pred_type=pred_type)
+
+    # Make a grid out of the images
+    image_grid = make_grid(images, rows=4, cols=4)
+
+    # Save the images
+    test_dir = os.path.join(config.output_dir, "samples")
+    os.makedirs(test_dir, exist_ok=True)
+    image_grid.save(f"{test_dir}/{epoch:04d}.png")
+
+
+def compute_sigma(alpha):
+    return torch.sqrt(1 - alpha ** 2)
+
+
+def batch_first(a):
+    return a.permute(3, 0, 1, 2)
+
+
+def batch_last(a):
+    return a.permute(1, 2, 3, 0)
+
+
+dataset.set_transform(transform)
+train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+
+pretrained_student = ""#config.output_dir + "/0epoch5/" #""##  #
+
+model_id = "google/ddpm-cifar10-32"
+
+# load model and scheduler
+teacher = UNet2DModel.from_pretrained("c10/v_epoch21")#DDPMPipeline.from_pretrained(model_id).unet#UNet2DModel.from_pretrained("c10/1epoch5")
+teacher = teacher.to("cuda:0")
+
+if pretrained_student == "":
+    student = copy.deepcopy(teacher)
+else:
+    student = UNet2DModel.from_pretrained(pretrained_student)
+
+
+optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate)
+
+lr_scheduler = get_cosine_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=config.lr_warmup_steps,
+    num_training_steps=(len(train_dataloader) * config.num_epochs),
+)
+
+gen = torch.Generator(device)
+gen.manual_seed(config.seed)
+
+
+def train_loop(config, student, optimizer, train_dataloader, lr_scheduler, teacher, schedule):
     # Initialize accelerator and tensorboard logging
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
@@ -36,26 +141,22 @@ def train_loop_eps(config, student, optimizer, train_dataloader, lr_scheduler, t
     global_step = 0
     K = 3
     starting_K = 0
-    N = 512
+    N = 1024
+    noise_scheduler = CustomScheduler(device, schedule)
     starting_epoch = 0
+    #ts = torch.from_numpy(np.arange(0, N)[::-1].copy()).to(device)
+    one = torch.tensor([1], device=device, dtype=torch.int64)
+    # Add 2 elements at the beggining to evaluate t-1 and t-2
+    #ts = torch.cat((one, one, ts), 0)
+    # Timesteps for mid-steps e.g. t - 0.5/N
+    ts2 = torch.from_numpy(np.arange(0, 2 * N)[::-1].copy()).to(device)
+    ts2 = torch.cat((one, one, ts2), 0)
+    ts2N = ts2/N
+    #tsN = ts/N
+    betas = noise_scheduler.get_betas(2 * N, ts2)
+    alphas = 1 - betas
+    alphas = torch.cumprod(alphas, dim=0)
     for j in range(starting_K, K):
-        noise_scheduler = TrigScheduler(device, schedule)
-
-        # ts = torch.from_numpy(np.arange(0, N)[::-1].copy()).to(device)
-        one = torch.tensor([1], device=device, dtype=torch.int64)
-        # Add 2 elements at the beggining to evaluate t-1 and t-2
-        # ts = torch.cat((one, one, ts), 0)
-        # Timesteps for mid-steps e.g. t - 0.5/N
-        ts2 = torch.from_numpy(np.arange(0, 2 * N)[::-1].copy()).to(device)
-        ts2 = torch.cat((one, one, ts2), 0)
-        if timestep_type == "discrete":
-            ts2N = ts2
-        else:
-            ts2N = ts2/N
-        # tsN = ts/N
-        betas = noise_scheduler.get_betas(2 * N, ts2)
-        alphas = 1 - betas
-
         # Student parameters = Teacher parameters
         if j > 1:
             student.load_state_dict(teacher.state_dict())
@@ -98,7 +199,7 @@ def train_loop_eps(config, student, optimizer, train_dataloader, lr_scheduler, t
 
                 xT_t = (zT_t - sigma_t * epsT_t) / alpha_t
 
-                zT_t1 = alpha_t1 * xT_t + sigma_t1 * epsT_t
+                zT_t1 = alpha_t1 * xT_t + (sigma_t1 / sigma_t) * (zT_t - alpha_t * xT_t)
                 z_t1 = batch_first(zT_t1)
 
                 eps_t1 = teacher(z_t1, ts2N[i-1], return_dict=False)[0]
@@ -106,11 +207,10 @@ def train_loop_eps(config, student, optimizer, train_dataloader, lr_scheduler, t
 
                 xT_t1 = (zT_t1 - sigma_t1 * epsT_t1) / alpha_t1
 
-                zT_t2 = alpha_t2 * xT_t1 + sigma_t2 * epsT_t1
-
+                zT_t2 = alpha_t2 * xT_t1 + (sigma_t2 / sigma_t1) * (zT_t1 - alpha_t1 * xT_t1)
 
                 x_tilde = (zT_t2 - (sigma_t2 / sigma_t) * zT_t) / (alpha_t2 - (sigma_t2 / sigma_t) * alpha_t)
-                eps_tilde = (zT_t2 - alpha_t2 * x_tilde) / sigma_t2
+
                 omega_t = torch.max(torch.tensor([torch.mean(alpha_t ** 2 / sigma_t ** 2), 1]))
                 #i2 = (i//2).to(torch.long)
                 #alpha_s = alphas[ts2[i2]]
@@ -121,21 +221,15 @@ def train_loop_eps(config, student, optimizer, train_dataloader, lr_scheduler, t
                 with accelerator.accumulate(student):
                     # Predict the noise residual
                     #student(z_t, tsN[i], return_dict=False)[0]
-
                     eps_student = student(z_t, ts2N[i], return_dict=False)[0]
                     epsT_student = batch_last(eps_student)
                     #x_student = (zT_t - sigma_t * epsT_student) / alpha_t
-                    '''x1 = x_student.detach().cpu().numpy().transpose()[0]
-                    x2 = x_tilde.detach().cpu().numpy().transpose()[0]
+                    #x_student = alpha_t * zT_t - sigma_t * vT_student
+                    z_student = alpha_t * xT + sigma_t * epsT_student
 
-                    plt.imshow(x1)
-                    plt.show()
-                    plt.imshow(x2)
-                    plt.show()'''
+                    x_tilde_student = (zT_t2 - (sigma_t2 / sigma_t) * z_student) / (alpha_t2 - (sigma_t2 / sigma_t) * alpha_t)
 
-                    #loss_x = F.mse_loss(x_tilde, x_student)
-                    loss = omega_t * F.mse_loss(eps_tilde, epsT_student)
-                    #loss = torch.maximum(loss_x, loss_eps)
+                    loss = F.mse_loss(x_tilde, x_tilde_student)
                     accelerator.backward(loss)
 
                     accelerator.clip_grad_norm_(student.parameters(), 1.0)
@@ -151,14 +245,25 @@ def train_loop_eps(config, student, optimizer, train_dataloader, lr_scheduler, t
             # After each epoch you optionally sample some demo images with evaluate() and save the model
             if accelerator.is_main_process:
                 if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-                    evaluate(config, epoch, student, gen, int(N), schedule, PredTypes.eps, timestep_type)
+                    evaluate(config, epoch, student, gen, int(N/2), ScheduleTypes.COSINE, PredTypes.v)
 
                 if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                    file_path = config.output_dir + f'/{j}eepoch{epoch}/'
+                    file_path = config.output_dir + f'/{j}epoch{epoch}/'
                     if not os.path.exists(file_path):
                         os.mkdir(file_path)
                     student.save_pretrained(file_path)
                 accelerator.init_trackers("train_example")
         N = int(N/2)
         teacher.load_state_dict(student.state_dict())
+
+
+args = (config, student, optimizer, train_dataloader, lr_scheduler, teacher, ScheduleTypes.COSINE)
+
+train_loop(*args)
+
+#teacher = #UNet2DModel.from_pretrained("./c10/t-64/2epoch9", device_map="auto")
+#evaluate(config, 10, teacher, gen, 1024, ScheduleTypes.COSINE)
+
+
+
 
