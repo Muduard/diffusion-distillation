@@ -24,7 +24,7 @@ class TrainingConfig:
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook
     seed = 214
     device = "cuda"
-    saved_state = "c10/v_base/29/"
+    saved_state = ""
 
 config = TrainingConfig()
 config.dataset_name = "cifar10"
@@ -33,15 +33,13 @@ train_dataloader = get_dataloader(config.dataset_name, config.train_batch_size)
 gen = torch.Generator(config.device)
 gen.manual_seed(config.seed)
 
-
 model = make_model(config.image_size, config.device)
+#model = get_pretrained("c10/v_base/", config.device)#make_model(config.image_size, config.device)
 #model = torch.load("b.pt")
 #torch.save(model, "b.pt")
 #epsilon = torch.randn((1,3,32,32))
 #model = torch.jit.load("traced_diff.pt")
-print(model)
-#traced_model = torch.jit.trace(model, (epsilon, torch.tensor([1])),strict=False )
-#torch.jit.save(traced_model, "traced_diff.pt")
+
 noise_scheduler = CustomScheduler(config.device, ScheduleTypes.COSINE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
@@ -50,13 +48,12 @@ lr_scheduler = get_cosine_schedule_with_warmup(
     num_warmup_steps=config.lr_warmup_steps,
     num_training_steps=(len(train_dataloader) * config.num_epochs),
 )
-
+#lr_scheduler.load_state_dict(torch.load("c10/v_base/34/scheduler.pkl"))
 
 def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, pred_type):
     # Initialize accelerator and tensorboard logging
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
         logging_dir=os.path.join(config.output_dir, "logs")
     )
 
@@ -74,7 +71,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, pred_ty
         accelerator.load_state(config.saved_state)
     n = 1024
     global_step = 0
-    starting_epoch = 30
+    starting_epoch = 0
 
     # Now you train the model
     for epoch in range(starting_epoch, config.num_epochs):
@@ -98,25 +95,24 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, pred_ty
             zT_t = (xT * alpha_t + sigma_t * epsilonT)
             z_t = batch_first(zT_t)
 
-            with accelerator.accumulate(model):
-                # Predict the noise residual
-                pred = model(z_t, t, return_dict=False)[0]
-                if pred_type == PredTypes.eps:
-                    loss = F.mse_loss(pred, epsilon)
+            # Predict the noise residual
+            pred = model(z_t, t, return_dict=False)[0]
+            if pred_type == PredTypes.eps:
+                loss = F.mse_loss(pred, epsilon)
 
-                elif pred_type == PredTypes.x:
-                    loss = F.mse_loss(pred, x)
+            elif pred_type == PredTypes.x:
+                loss = F.mse_loss(pred, x)
 
-                elif pred_type == PredTypes.v:
-                    v = alpha_t * epsilonT - sigma_t * xT
-                    v = batch_first(v)
-                    loss = F.mse_loss(pred, v)
+            elif pred_type == PredTypes.v:
+                v = alpha_t * epsilonT - sigma_t * xT
+                v = batch_first(v)
+                loss = F.mse_loss(pred, v)
 
-                accelerator.backward(loss)
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
 
             progress_bar.update(1)
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
@@ -126,20 +122,16 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, pred_ty
 
         # After each epoch you optionally sample some demo images with evaluate() and save the model
         if accelerator.is_main_process:
-            #if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
-            #     evaluate(config, epoch, model, gen, n, ScheduleTypes.COSINE, pred_type, "continuous", config.device)
+            if (epoch + 1) % config.save_image_epochs == 0 or epoch == config.num_epochs - 1:
+                 evaluate(config, epoch, model, gen, n, ScheduleTypes.COSINE, pred_type, "continuous", config.device)
 
             if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
                 file_path = config.output_dir + f'/{epoch}/'
                 if not os.path.exists(file_path):
                     os.mkdir(file_path)
-                m = accelerator.prepare(model)
-                m = accelerator.unwrap_model(m)
-                #torch.save(model, file_path + "diffusion_pytorch_model.pt")
-                accelerator.save(m.state_dict(), file_path + "b.pkl")
-                accelerator.save_state(file_path)
-                #model.save_pretrained(file_path)
-                #batch_sample(model,ScheduleTypes.COSINE, 128, 5000, 16, 101, './v_base29-128-memory/', "continuous", PredTypes.v)
+                m = accelerator.unwrap_model(model)
+                m.save_pretrained(file_path)
+                torch.save(lr_scheduler.state_dict(), file_path + "scheduler.pkl")
 
 
 args = (config, model, optimizer, train_dataloader, lr_scheduler, PredTypes.v)
