@@ -84,7 +84,6 @@ def diffuse_from_v(v, z, alpha, sigma, alpha_next, sigma_next):
     z_next = torch.cos(phi_next - phi) * z + torch.sin(phi_next - phi) * v
     return z_next
 
-#Epoca 28 -> 87k steps
 
 def train_loop(config, student, optimizer, train_dataloader, lr_scheduler, teacher, schedule, timestep_type, pred_type, starting_epoch):
     # Initialize accelerator and tensorboard logging

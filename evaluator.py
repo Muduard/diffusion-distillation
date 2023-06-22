@@ -6,7 +6,7 @@ from scheduling import ScheduleTypes, CustomScheduler, PredTypes
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from train_utils import make_model,freeze_model
+from train_utils import make_model, freeze_model
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -29,9 +29,9 @@ def batch_sample(model, schedule, n_steps, n_images, batch_size, seed, save_path
             j += 1
 
 
-model = UNet2DModel.from_pretrained('c10/v_base/83', device_map="auto")
+model = UNet2DModel.from_pretrained('c10/distill-v/3_30', device_map="auto")
 freeze_model(model)
 #model = make_model(32, "cuda")
 #model.load_state_dict(torch.load("c10/v_base/30/b.pkl"))
 #model = model.to(device)
-batch_sample(model, ScheduleTypes.COSINE, 1024, 5000, 16, 101, './v-base83-1024/', "continuous", PredTypes.v)
+batch_sample(model, ScheduleTypes.COSINE, 64, 16, 16, 321, 'show2-vdistill3/', "continuous", PredTypes.v)

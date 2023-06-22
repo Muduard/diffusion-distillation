@@ -58,11 +58,9 @@ def diff_fid_over_time_plot(path1, path2, path3, n_datapoints, n_dataset):
 def compute_original_statistics(path, stats_name):
     fid_score.save_fid_stats((path, stats_name), 16, "cuda:0",2048,16)
 
-n_datapoints = 1
-path1 = "27"
+n_datapoints = 10
 path1 = "cifar_stats.npz"
-path2 = "./v-base83-32/"
-path3 = "eps_good75/"
+path2 = "v-base83-1024/"
 
-fid_over_time_plot(path1,path2,n_datapoints,2000)
+fid_over_time_plot(path1,path2,n_datapoints,5000)
 

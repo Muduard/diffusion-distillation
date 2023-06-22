@@ -26,8 +26,8 @@ def get_sample_str(files, sample):
     return res
 
 
-path1 = "b29/"
-path2 = "b/"
+path1 = "v-base83-1024/"
+path2 = "v-base83-32/"
 
 files1 = os.listdir(path1)
 files2 = os.listdir(path2)

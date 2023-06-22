@@ -34,11 +34,7 @@ gen = torch.Generator(config.device)
 gen.manual_seed(config.seed)
 
 model = make_model(config.image_size, config.device)
-#model = get_pretrained("c10/v_base/", config.device)#make_model(config.image_size, config.device)
-#model = torch.load("b.pt")
-#torch.save(model, "b.pt")
-#epsilon = torch.randn((1,3,32,32))
-#model = torch.jit.load("traced_diff.pt")
+
 
 noise_scheduler = CustomScheduler(config.device, ScheduleTypes.COSINE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
@@ -48,7 +44,8 @@ lr_scheduler = get_cosine_schedule_with_warmup(
     num_warmup_steps=config.lr_warmup_steps,
     num_training_steps=(len(train_dataloader) * config.num_epochs),
 )
-#lr_scheduler.load_state_dict(torch.load("c10/v_base/34/scheduler.pkl"))
+if config.saved_state != "":
+    lr_scheduler.load_state_dict(torch.load(config.aved_state + "scheduler.pkl"))
 
 def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, pred_type):
     # Initialize accelerator and tensorboard logging
